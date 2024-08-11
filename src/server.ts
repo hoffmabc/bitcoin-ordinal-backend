@@ -1,10 +1,12 @@
 import express from 'express';
-import { Psbt, networks, payments } from 'bitcoinjs-lib';
+import { Network, Psbt, payments, address as bitcoinAddress, initEccLib, networks } from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
 import { ECPairFactory } from 'ecpair';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import axios from 'axios';
+
+initEccLib(ecc);
 
 const ECPair = ECPairFactory(ecc);
 
@@ -14,26 +16,61 @@ const port = 3002;
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
-interface OrdinalRequest {
+interface PrepareOrdinalTxRequest {
   content: string;
   fileType: string;
   fileData: string | null;
+  address: string;
+  isTestnet: boolean;
 }
 
-app.post('/api/prepare-ordinal-tx', async (req, res) => {
-  const { content, fileType, fileData, address, isTestnet } = req.body;
+interface UTXO {
+  txid: string;
+  vout: number;
+  status: {
+    confirmed: boolean;
+    block_height: number;
+    block_hash: string;
+    block_time: number;
+  };
+  value: number;
+  scriptpubkey?: string;
+}
 
+app.post('/api/prepare-ordinal-tx', async (req: express.Request, res: express.Response) => {
+  interface PrepareOrdinalTxRequest {
+    content: string;
+    fileType: string;
+    fileData: string | null;
+    address: string;
+    isTestnet: boolean;
+  }
+
+  const { content, fileType, fileData, address, isTestnet } = req.body as PrepareOrdinalTxRequest;
   const network = isTestnet ? networks.testnet : networks.bitcoin;
   const apiUrl = isTestnet ? 'https://blockstream.info/testnet/api' : 'https://blockstream.info/api';
 
+  console.log('Received request:', { content, fileType, address, isTestnet });
+
   try {
     const inscriptionData = createInscriptionData(content, fileType, fileData);
-    const psbt = await createOrdinalPsbt(inscriptionData, address);
+    console.log('Inscription data created');
+
+    const psbt = await createOrdinalPsbt(inscriptionData, address, network, apiUrl);
+    console.log('PSBT created');
+
     const psbtBase64 = psbt.toBase64();
+    console.log('PSBT converted to Base64');
+
     res.json({ psbt: psbtBase64 });
   } catch (error) {
     console.error('Error preparing ordinal transaction:', error);
-    res.status(500).json({ error: 'Failed to prepare ordinal transaction' });
+    res.status(500).json({ 
+      error: 'Failed to prepare ordinal transaction', 
+      details: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+      fullError: JSON.stringify(error, Object.getOwnPropertyNames(error), 2)
+    });
   }
 });
 
@@ -63,78 +100,108 @@ function createInscriptionData(content: string, fileType: string, fileData: stri
   return Buffer.from(envelope, 'utf8');
 }
 
-async function createOrdinalPsbt(inscriptionData: Buffer, address: string): Promise<Psbt> {
-  const network = networks.bitcoin; // Use mainnet
+async function createOrdinalPsbt(inscriptionData: Buffer, address: string, network: Network, apiUrl: string): Promise<Psbt> {
   const psbt = new Psbt({ network });
 
-  // Fetch UTXOs for the given address
-  const utxos = await fetchUtxos(address);
-
-  if (utxos.length === 0) {
-    throw new Error('No UTXOs available');
-  }
-
-  let totalInput = 0;
-  utxos.forEach((utxo: { txid: any; vout: any; scriptPubKey: WithImplicitCoercion<string> | { [Symbol.toPrimitive](hint: "string"): string; }; value: number; }) => {
-    psbt.addInput({
-      hash: utxo.txid,
-      index: utxo.vout,
-      witnessUtxo: {
-        script: Buffer.from(utxo.scriptPubKey, 'hex'),
-        value: utxo.value,
-      },
-    });
-    totalInput += utxo.value;
-  });
-
-  // Add the ordinal output (546 satoshis is the dust limit)
-  psbt.addOutput({
-    script: payments.embed({ data: [inscriptionData] }).output!,
-    value: 546,
-  });
-
-  // Estimate the fee (this is a simplified estimation)
-  const estimatedSize = psbt.extractTransaction().virtualSize() + 100; // Add some buffer
-  const feeRate = await getFeeRate(); // sats/vbyte
-  const fee = estimatedSize * feeRate;
-
-  // Add change output
-  const changeAmount = totalInput - 546 - fee;
-  if (changeAmount > 546) {
-    psbt.addOutput({
-      address: address,
-      value: changeAmount,
-    });
-  }
-
-  return psbt;
-}
-
-
-
-async function fetchUtxos(address: string) {
-  console.log('Fetching UTXOs for address:', address);
   try {
-    const response = await axios.get(`https://blockstream.info/api/address/${address}/utxo`);
-    console.log('UTXOs fetched:', response.data);
-    if (response.data.length === 0) {
-      console.log('No UTXOs found for this address. Balance might be 0.');
+    const utxos = await fetchUtxos(address, apiUrl);
+
+    if (utxos.length === 0) {
+      throw new Error('No UTXOs available');
     }
-    return response.data;
+
+    console.log('UTXOs:', JSON.stringify(utxos, null, 2));
+
+    let totalInput = 0;
+    utxos.forEach((utxo: { txid: any; vout: undefined; value: number | undefined; scriptpubkey: WithImplicitCoercion<string> | { [Symbol.toPrimitive](hint: "string"): string; }; }, index: any) => {
+      console.log(`Processing UTXO at index ${index}:`, JSON.stringify(utxo, null, 2));
+
+      if (!utxo.txid || utxo.vout === undefined || utxo.value === undefined) {
+        console.error(`Invalid UTXO at index ${index}:`, JSON.stringify(utxo, null, 2));
+        throw new Error(`Invalid UTXO data at index ${index}`);
+      }
+
+      try {
+        let script: Buffer;
+        if (utxo.scriptpubkey) {
+          script = Buffer.from(utxo.scriptpubkey, 'hex');
+        } else {
+          // Derive scriptpubkey from the address
+          script = bitcoinAddress.toOutputScript(address, network);
+        }
+
+        // For P2TR inputs, we need to provide the internal key
+        const inputData: any = {
+          hash: utxo.txid,
+          index: utxo.vout,
+          witnessUtxo: {
+            script: script,
+            value: utxo.value,
+          },
+        };
+
+        if (address.startsWith('tb1p') || address.startsWith('bc1p')) {
+          // This is a P2TR address
+          const { internalPubkey } = payments.p2tr({ address, network });
+          if (internalPubkey) {
+            inputData.tapInternalKey = internalPubkey;
+          }
+        }
+
+        psbt.addInput(inputData);
+        totalInput += utxo.value;
+      } catch (error) {
+        console.error(`Error adding input at index ${index}:`, error);
+        throw error;
+      }
+    });
+
+    // Add the ordinal output (546 satoshis is the dust limit)
+    psbt.addOutput({
+      script: payments.embed({ data: [inscriptionData] }).output!,
+      value: 546,
+    });
+
+    // Estimate the fee (using a fixed size estimation)
+    const estimatedSize = 200 + (psbt.data.inputs.length * 100) + (psbt.data.outputs.length * 50);
+    const feeRate = await getFeeRate(apiUrl); // sats/vbyte
+    const fee = estimatedSize * feeRate;
+
+    // Add change output
+    const changeAmount = totalInput - 546 - fee;
+    if (changeAmount > 546) {
+      psbt.addOutput({
+        address: address,
+        value: changeAmount,
+      });
+    }
+
+    return psbt;
   } catch (error) {
-    if (error instanceof Error) {
-      console.error('Error fetching UTXOs:', (error as any).response ? (error as any).response.data : error.message);
-    } else {
-      console.error('Unknown error occurred while fetching UTXOs');
-    }
+    console.error('Error in createOrdinalPsbt:', error);
     throw error;
   }
 }
 
-async function getFeeRate() {
-  // Fetch current fee rate from a Bitcoin API. This is a placeholder.
-  const response = await axios.get('https://blockstream.info/api/fee-estimates');
-  return response.data['2']; // Use 2-block target fee rate
+async function fetchUtxos(address: string, apiUrl: string) {
+  try {
+    const response = await axios.get(`${apiUrl}/address/${address}/utxo`);
+    console.log('UTXO response:', response.data); // Log the response for debugging
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching UTXOs:', error);
+    throw error;
+  }
+}
+
+async function getFeeRate(apiUrl: string): Promise<number> {
+  try {
+    const response = await axios.get<Record<string, number>>(`${apiUrl}/fee-estimates`);
+    return response.data['2'] || 1; // Use 2-block target fee rate, default to 1 sat/vbyte if not available
+  } catch (error) {
+    console.error('Error fetching fee rate:', error);
+    return 1; // Default to 1 sat/vbyte if there's an error
+  }
 }
 
 app.post('/api/broadcast-tx', async (req, res) => {
@@ -152,7 +219,7 @@ app.post('/api/broadcast-tx', async (req, res) => {
 });
 
 app.post('/api/create-ordinal', (req, res) => {
-  const { content, fileType, fileData }: OrdinalRequest = req.body;
+  const { content, fileType, fileData }: PrepareOrdinalTxRequest = req.body;
 
   // Simulate ordinal creation process
   console.log('Creating ordinal with content:', content);

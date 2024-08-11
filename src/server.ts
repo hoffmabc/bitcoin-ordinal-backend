@@ -21,12 +21,16 @@ interface OrdinalRequest {
 }
 
 app.post('/api/prepare-ordinal-tx', async (req, res) => {
-  const { content, fileType, fileData, address } = req.body;
+  const { content, fileType, fileData, address, isTestnet } = req.body;
+
+  const network = isTestnet ? networks.testnet : networks.bitcoin;
+  const apiUrl = isTestnet ? 'https://blockstream.info/testnet/api' : 'https://blockstream.info/api';
 
   try {
     const inscriptionData = createInscriptionData(content, fileType, fileData);
     const psbt = await createOrdinalPsbt(inscriptionData, address);
-    res.json({ psbt: psbt.toBase64() });
+    const psbtBase64 = psbt.toBase64();
+    res.json({ psbt: psbtBase64 });
   } catch (error) {
     console.error('Error preparing ordinal transaction:', error);
     res.status(500).json({ error: 'Failed to prepare ordinal transaction' });
@@ -133,18 +137,18 @@ async function getFeeRate() {
   return response.data['2']; // Use 2-block target fee rate
 }
 
-app.post('/api/broadcast-tx', (req, res) => {
-  const { signedTx } = req.body;
+app.post('/api/broadcast-tx', async (req, res) => {
+  const { signedTx, isTestnet } = req.body;
 
-  // Here you would:
-  // 1. Decode the signed transaction
-  // 2. Broadcast it to the Bitcoin network
-  // 3. Return the transaction ID
+  const apiUrl = isTestnet ? 'https://blockstream.info/testnet/api' : 'https://blockstream.info/api';
 
-  // For this example, we'll just return a dummy transaction ID
-  const dummyTxid = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-  res.json({ txid: dummyTxid });
+  try {
+    const response = await axios.post(`${apiUrl}/tx`, signedTx);
+    res.json({ txid: response.data });
+  } catch (error) {
+    console.error('Error broadcasting transaction:', error);
+    res.status(500).json({ error: 'Failed to broadcast transaction' });
+  }
 });
 
 app.post('/api/create-ordinal', (req, res) => {
